@@ -1,2 +1,3 @@
-# aping
-Advanced ping for network test
+# anet
+
+Advanced network tools for test, initial created for T6T
