@@ -18,7 +18,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 	"sync"
 
 	"github.com/gosuri/uiprogress"
@@ -56,33 +55,78 @@ For example:
 		if _, err := os.Stat(fLocalfile); err != nil {
 			return fmt.Errorf("local file '%s' not exist", fLocalfile)
 		}
-		destfile := filepath.Base(fLocalfile)
-		tsk := &batchUpload{
-			ftpServerInfo: ftpServerInfo{
-				user:    fUser,
-				passwd:  fPasswd,
-				destdir: fDestdir},
-			localfile: fLocalfile,
-			destfile:  destfile,
-			verbose:   true}
 
-		progress.Start()
+		// try to create all the task
+		allprogress := make([]simpleUIBind, nips)
 		wg := sync.WaitGroup{}
 		wg.Add(nips)
 		errmsg := make(chan error, nips)
+		for i := range allprogress {
+			allprogress[i].upload, err = newFileUpload(&ftpServerInfo{
+				user:   fUser,
+				passwd: fPasswd,
+				ipaddr: ips[i]},
+				fLocalfile,
+				fDestdir)
+			allprogress[i].bar = progress.AddBar(100).AppendCompleted().PrependElapsed()
+			allprogress[i].bar.PrependFunc(func(f *fileUpload) uiprogress.DecoratorFunc {
+				return func(b *uiprogress.Bar) string {
 
-		for _, ip := range ips {
-			go func(nip net.IP) {
+					if f == nil {
+						return fmt.Sprintf("%s :OPEN :ERROR", f.server.ipaddr.String())
+					}
+					if f.err != nil {
+						return fmt.Sprintf("%s :%s :ERROR", f.server.ipaddr.String(), f.status)
+					}
+					return fmt.Sprintf("%s :%s :     ", f.server.ipaddr.String(), f.status)
+
+				}
+			}(allprogress[i].upload))
+		}
+
+		progress.Start()
+
+		for _, item := range allprogress {
+			go func(s simpleUIBind) {
 				var err error
 				defer wg.Done()
-				err = tsk.upload(nip)
+				err = s.upload.upload()
 				if err != nil {
 					errmsg <- err
 				}
-			}(ip)
+			}(item)
+			time.Sleep(time.Millisecond * 100)
 		}
 
+		refreshTimer := time.NewTimer(time.Millisecond * 100)
+		go func() {
+			refreshTimer.Reset(time.Millisecond * 100)
+			_, ok := <-refreshTimer.C
+			if !ok {
+				return
+			}
+			for _, item := range allprogress {
+				f := item.upload
+				bar := item.bar
+				if bar.Current() == 100 || f.err != nil { // all done, no need to update anymore
+					break
+				}
+				if f.size == 0 { // empty file,
+					if f.status == "DONE" {
+						bar.Set(99)
+						bar.Incr()
+					}
+
+				} else {
+					percent := f.offset * 100 / f.size
+					bar.Set(percent - 1)
+					bar.Incr()
+				}
+			}
+		}()
+
 		wg.Wait()
+		refreshTimer.Stop()
 		progress.Stop()
 		errcount := 0
 
@@ -108,95 +152,91 @@ func init() {
 }
 
 type ftpServerInfo struct {
-	user    string
-	passwd  string
+	ipaddr net.IP
+	user   string
+	passwd string
+}
+
+type fileUpload struct {
+	fs      *os.File
+	server  *ftpServerInfo
 	destdir string
+	offset  int
+	size    int
+	err     error
+	status  string
+	lock    sync.Mutex
 }
 
-type batchUpload struct {
-	ftpServerInfo
-	localfile string
-	destfile  string
-	verbose   bool
-}
-
-type pFile struct {
-	*os.File
-	offset int
-	bar    *uiprogress.Bar
-}
-
-func newPFile(fpath string) (*pFile, error) {
-	f, err := os.Open(fpath)
+func newFileUpload(server *ftpServerInfo, localfile string, destdir string) (*fileUpload, error) {
+	fileInfo, err := os.Stat(localfile)
 	if err != nil {
 		return nil, err
 	}
-	size := fileSize(fpath)
-	bar := progress.AddBar(size).AppendCompleted().PrependElapsed()
-	return &pFile{f, 0, bar}, nil
+	fileSize := fileInfo.Size() //获取size
+	f, err := os.Open(localfile)
+	if err != nil {
+		return nil, err
+	}
+	return &fileUpload{
+		fs:      f,
+		destdir: destdir,
+		server:  server,
+		size:    int(fileSize)}, nil
 }
 
-func (f *pFile) Read(b []byte) (n int, err error) {
-	n, err = f.File.Read(b)
-	f.offset += n
-	f.bar.Set(f.offset - 1)
-	f.bar.Incr()
-	return n, err
-}
-func fileSize(path string) int {
-	fileInfo, err := os.Stat(path)
-	if err != nil {
-		return 0
-	}
-	fileSize := fileInfo.Size() //获取size
-	return int(fileSize)
-}
-func (batch *batchUpload) upload(destip net.IP) error {
-	var err error
-	iscomplete := false
-	connstr := fmt.Sprintf("%s:21", destip.String())
+func (f *fileUpload) upload() error {
+
+	connstr := fmt.Sprintf("%s:21", f.server.ipaddr.String())
 
 	// because ftp lib has no time, try to connect it just for test
+	f.status = "CONNECT"
 	try, err := net.DialTimeout("tcp", connstr, time.Second*1)
 	if err != nil {
+		f.err = err
 		return err
 	}
 	try.Close()
-
-	f, err := newPFile(batch.localfile)
+	ftp, err := goftp.Connect(connstr)
 	if err != nil {
-		return err
-	}
-	defer f.Close()
-
-	f.bar.PrependFunc(func(b *uiprogress.Bar) string {
-		if err != nil {
-			return fmt.Sprintf("%s :ERROR", destip)
-		}
-		if iscomplete {
-			return fmt.Sprintf("%s :DONE ", destip)
-		}
-		return fmt.Sprintf("%s :     ", destip)
-
-	})
-	defer f.bar.Incr()
-	ftp, err := goftp.Connect(fmt.Sprintf("%s:21", destip))
-	if err != nil {
+		f.err = err
 		return err
 	}
 	defer ftp.Quit()
-	if err = ftp.Login(batch.user, batch.passwd); err != nil {
+	f.status = "LOGIN"
+	if err = ftp.Login(f.server.user, f.server.passwd); err != nil {
+		f.err = err
 		return err
 	}
-	if err = ftp.Cwd(batch.destdir); err != nil {
+	f.status = "CHANG DIR"
+	if err = ftp.Cwd(f.destdir); err != nil {
+		f.err = err
 		return err
 	}
 
-	if err = ftp.Stor(batch.destfile, f); err != nil {
+	f.status = "UPLOAD"
+
+	if err = ftp.Stor(f.fs.Name(), f); err != nil {
+		f.err = err
 		return err
 	}
-	iscomplete = true
-
+	f.status = "DONE"
 	return nil
+}
 
+func (f *fileUpload) Read(b []byte) (int, error) {
+	n, err := f.fs.Read(b)
+	f.lock.Lock()
+	defer f.lock.Unlock()
+	f.offset += n
+	return n, err
+}
+
+func (f *fileUpload) Close() error {
+	return f.fs.Close()
+}
+
+type simpleUIBind struct {
+	bar    *uiprogress.Bar
+	upload *fileUpload
 }
