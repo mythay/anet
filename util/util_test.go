@@ -54,6 +54,7 @@ func TestParseMultipleIPRange(t *testing.T) {
 		{"basic ip", args{[]string{"192.168.1.2-1"}}, nil, true},
 
 		{"basic ip", args{[]string{"192.168.1.1", "192.168.1.1"}}, []net.IP{net.ParseIP("192.168.1.1")}, false},
+		{"basic ip", args{[]string{"192.168.1.1", "1.1.1.1"}}, []net.IP{net.ParseIP("1.1.1.1"), net.ParseIP("192.168.1.1")}, false},
 		{"basic ip", args{[]string{"192.168.1.2-3", "192.168.1.1-2"}}, []net.IP{net.ParseIP("192.168.1.1"), net.ParseIP("192.168.1.2"), net.ParseIP("192.168.1.3")}, false},
 	}
 	for _, tt := range tests {

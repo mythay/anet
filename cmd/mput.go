@@ -31,14 +31,15 @@ import (
 )
 
 var fUser, fPasswd, fDestdir, fLocalfile string
+var flagGraph bool
 
-// ftpputCmd represents the put command
-var ftpputCmd = &cobra.Command{
-	Use:   "ftpput [ip]...",
+// mputCmd represents the put command
+var mputCmd = &cobra.Command{
+	Use:   "mput [ip]...",
 	Short: "upload file to ftp server",
 	Long: `upload file to multiple ftp server at the same time.
 For example:
-	anet ftpput 192.168.1.1 192.168.1.2`,
+	anet mput 192.168.1.1 192.168.1.2`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		// TODO: Work your own magic here
 		nargs := len(args)
@@ -53,18 +54,21 @@ For example:
 		if _, err := os.Stat(fLocalfile); err != nil {
 			return fmt.Errorf("local file '%s' not exist", fLocalfile)
 		}
+		if flagGraph {
+			return uploadDashView(ips)
+		}
+		return uploadSimpleView(ips)
 
-		// return uploadSimpleView(ips)
-		return uploadDashView(ips)
 	},
 }
 
 func init() {
-	RootCmd.AddCommand(ftpputCmd)
-	ftpputCmd.Flags().StringVarP(&fUser, "username", "u", "pcfactory", "A valid ftp user name")
-	ftpputCmd.Flags().StringVarP(&fPasswd, "password", "p", "pcfactory", "Correspoding ftp password")
-	ftpputCmd.Flags().StringVarP(&fDestdir, "directory", "d", "/fw", "Ftp server directory to store the file")
-	ftpputCmd.Flags().StringVarP(&fLocalfile, "localfile", "l", "App2.out", "local file path to be uploaded")
+	RootCmd.AddCommand(mputCmd)
+	mputCmd.Flags().StringVarP(&fUser, "username", "u", "pcfactory", "A valid ftp user name")
+	mputCmd.Flags().StringVarP(&fPasswd, "password", "p", "pcfactory", "Correspoding ftp password")
+	mputCmd.Flags().StringVarP(&fDestdir, "directory", "d", "/fw", "Ftp server directory to store the file")
+	mputCmd.Flags().StringVarP(&fLocalfile, "localfile", "l", "App2.out", "local file path to be uploaded")
+	mputCmd.Flags().BoolVarP(&flagGraph, "graph", "g", false, "graph ui output")
 
 }
 
@@ -165,22 +169,25 @@ func uploadDashView(ips []net.IP) error {
 	}
 	defer ui.Close()
 
-	g := ui.NewGauge()
-	g.Percent = 50
-	g.Height = 3
-
-	g.BorderLabel = "Gauge"
-	g.BarColor = ui.ColorRed
-	g.BorderFg = ui.ColorWhite
-	g.BorderLabelFg = ui.ColorCyan
-	ui.Body.AddRows(
-		ui.NewRow(
-			ui.NewCol(12, 0, g)))
 	nips := len(ips)
-	allprogress := make([]simpleUIBind, nips)
-	wg := sync.WaitGroup{}
-	wg.Add(nips)
-	errmsg := make(chan error, nips)
+	allprogress := make([]dashUIBind, nips)
+
+	sucessCount := 0
+	errcount := 0
+	quitLabel := ui.NewPar("Press q to exit")
+	quitLabel.Border = false
+	summaryLabel := ui.NewPar("Summary")
+	summaryLabel.Border = false
+	summaryPar := ui.NewPar(fmt.Sprintf(" %d/%d", sucessCount, nips))
+	summaryPar.Border = false
+	failLabel := ui.NewPar("Fail")
+	failLabel.Border = false
+	failPar := ui.NewPar(fmt.Sprintf(" %d", errcount))
+	failPar.Border = false
+	ui.Body.AddRows(ui.NewRow(ui.NewCol(6, 0, quitLabel),
+		ui.NewCol(2, 0, summaryLabel), ui.NewCol(1, 0, summaryPar),
+		ui.NewCol(2, 0, failLabel), ui.NewCol(1, 0, failPar)))
+
 	for i := range allprogress {
 		allprogress[i].upload, _ = newFileUpload(&ftpServerInfo{
 			user:   fUser,
@@ -188,68 +195,84 @@ func uploadDashView(ips []net.IP) error {
 			ipaddr: ips[i]},
 			fLocalfile,
 			fDestdir)
-		allprogress[i].bar = progress.AddBar(100).AppendCompleted().PrependElapsed()
-		allprogress[i].bar.PrependFunc(func(f *fileUpload) uiprogress.DecoratorFunc {
-			return func(b *uiprogress.Bar) string {
-				if f == nil {
-					return fmt.Sprintf("%-15s :OPEN :ERROR", f.server.ipaddr.String())
-				}
+		bar := ui.NewGauge()
+		bar.Percent = 0
+		bar.Height = 2
+		bar.Label = "{{percent}}%"
+		// bar.BorderLabel = ips[i].String()
+		bar.BarColor = ui.ColorGreen
+		bar.PaddingBottom = 1
+		bar.Border = false
+		bar.LabelAlign = ui.AlignLeft
+		allprogress[i].bar = bar
+		label := ui.NewPar(ips[i].String())
+		label.Border = false
+		// label.Text = ips[i].String()
+		label.Height = 2
 
-				if f.err != nil {
-					return fmt.Sprintf("%-15s :%-8s :ERROR", f.server.ipaddr.String(), f.status)
-				}
-				if b.Current() != 100 {
-					if f.size == 0 { // empty file,
-						if f.status == "DONE" {
-							b.Set(99)
-							b.Incr()
-						}
-
-					} else {
-						percent := f.offset * 100 / f.size
-						b.Set(percent - 1)
-						b.Incr()
-					}
-				}
-				return fmt.Sprintf("%-15s :%-8s       ", f.server.ipaddr.String(), f.status)
-
-			}
-		}(allprogress[i].upload))
+		// label.Y = 1
+		ui.Body.AddRows(ui.NewRow(ui.NewCol(3, 0, label), ui.NewCol(9, 0, bar)))
 	}
-	fmt.Println(len(allprogress))
-	progress.Start()
 
 	for _, item := range allprogress {
-		go func(s simpleUIBind) {
+		go func(s dashUIBind) {
 			var err error
-			defer wg.Done()
 			err = s.upload.upload()
 			if err != nil {
-				errmsg <- err
+				errcount++
+			} else {
+				sucessCount++
 			}
 		}(item)
 		time.Sleep(time.Millisecond * 10)
 	}
 
-	wg.Wait()
-	time.Sleep(time.Millisecond * 200)
-	progress.Stop()
-	errcount := 0
-
-	close(errmsg)
-	for _ = range errmsg {
-		errcount++
-	}
-
-	fmt.Printf("\nSTATISTIC: %d/%d success\n", nips-errcount, nips)
 	// calculate layout
 	ui.Body.Align()
 
 	ui.Render(ui.Body)
+	ui.Handle("/timer/1s", func(ui.Event) {
+		summaryPar.Text = fmt.Sprintf(" %d/%d", sucessCount, nips)
+		failPar.Text = fmt.Sprintf(" %d", errcount)
+		for _, item := range allprogress {
+			bar := item.bar
+			f := item.upload
+			if f == nil {
+				bar.Label = "OPEN ERROR {{percent}}%"
+				bar.PercentColor = ui.ColorRed
+				continue
+			}
 
-	ui.Render(g) // feel free to call Render, it's async and non-block
+			if f.err != nil {
+				bar.Label = f.status + " ERROR {{percent}}%"
+				bar.PercentColor = ui.ColorRed
+				continue
+			}
+			if bar.Percent != 100 {
+				if f.size == 0 { // empty file,
+					if f.status == "DONE" {
+						bar.Percent = 100
+					}
+
+				} else {
+					percent := f.offset * 100 / f.size
+					bar.Percent = percent
+				}
+			}
+			bar.Label = f.status + " {{percent}}%"
+		}
+		ui.Body.Align()
+		ui.Clear()
+		ui.Render(ui.Body)
+	})
 	ui.Handle("/sys/kbd/q", func(ui.Event) {
 		ui.StopLoop()
+	})
+	ui.Handle("/sys/wnd/resize", func(e ui.Event) {
+		ui.Body.Width = ui.TermWidth()
+		ui.Body.Align()
+		ui.Clear()
+		ui.Render(ui.Body)
 	})
 	ui.Loop()
 	return nil
@@ -324,5 +347,9 @@ func (f *fileUpload) Close() error {
 
 type simpleUIBind struct {
 	bar    *uiprogress.Bar
+	upload *fileUpload
+}
+type dashUIBind struct {
+	bar    *ui.Gauge
 	upload *fileUpload
 }
