@@ -16,6 +16,7 @@ package cmd
 
 import (
 	"errors"
+	"io/ioutil"
 	"os"
 
 	"golang.org/x/net/icmp"
@@ -40,21 +41,14 @@ var pauseSignal = make(chan int)
 
 // pingCmd represents the ping command
 var pingCmd = &cobra.Command{
-	Use:   "ping",
-	Short: "A brief description of your command",
-	Long: `A longer description that spans multiple lines and likely contains examples
-and usage of using your command. For example:
-
-Cobra is a CLI library for Go that empowers applications.
-This application is a tool to generate the needed files
-to quickly create a Cobra application.`,
+	Use:   "ping [ip]...",
+	Short: "Advanced ping command",
+	Long: `Advanced ping command to test multiple target at the sametime.
+For example:
+	anet ping 192.168.1.1-10`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		// TODO: Work your own magic here
-		err := ui.Init()
-		if err != nil {
-			panic(err)
-		}
-		defer ui.Close()
+		var err error
 		nargs := len(args)
 		if nargs == 0 {
 			return errors.New("at least one ip is needed")
@@ -63,6 +57,11 @@ to quickly create a Cobra application.`,
 		if err != nil {
 			return err
 		}
+		err = ui.Init()
+		if err != nil {
+			panic(err)
+		}
+		defer ui.Close()
 		// nips := len(ips)
 		helpBox := ui.NewList()
 		helpBox.Items = []string{
@@ -213,25 +212,32 @@ func newPinger(ip net.IP, interval time.Duration, timeout time.Duration) (*pinge
 }
 
 func (p *pinger) once() error {
+	var err error
 	p.seq++
 	if p.seq > 0xffff {
 		p.seq = 0
 	}
 	reqPacket, _ := p.marshalMsg(nil)
 	p.reqcount++
+
 	start := time.Now()
 	p.conn.SetDeadline(start.Add(p.timeout))
-	if _, err := p.conn.Write(reqPacket); err != nil {
+	if _, err = p.conn.Write(reqPacket); err != nil {
 		p.errcount++
 		return err
 	}
-
+	defer func() {
+		if err != nil {
+			ioutil.ReadAll(p.conn)
+		}
+	}()
 	respPacket := make([]byte, 1500)
 	n, err := p.conn.Read(respPacket)
 	if err != nil {
 		p.errcount++
 		return err
 	}
+
 	duration := time.Now().Sub(start)
 	respPacket = func(b []byte) []byte {
 		if len(b) < 20 {
@@ -249,7 +255,8 @@ func (p *pinger) once() error {
 		body := rm.Body.(*icmp.Echo)
 		if body.Seq != p.seq {
 			p.errcount++
-			return fmt.Errorf("sequence not equal, expect %d, but %d", p.seq, body.Seq)
+			err = fmt.Errorf("sequence not equal, expect %d, but %d", p.seq, body.Seq)
+			return err
 		}
 		if duration > p.max {
 			p.max = duration

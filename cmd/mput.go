@@ -39,7 +39,7 @@ var mputCmd = &cobra.Command{
 	Short: "upload file to ftp server",
 	Long: `upload file to multiple ftp server at the same time.
 For example:
-	anet mput 192.168.1.1 192.168.1.2`,
+	anet mput 192.168.1.1-10`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		// TODO: Work your own magic here
 		nargs := len(args)

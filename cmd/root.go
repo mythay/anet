@@ -27,7 +27,7 @@ var flagVerbose, flagSilent bool
 var RootCmd = &cobra.Command{
 	Use:   "anet",
 	Short: "Advance network test tool for TeSysT",
-	Long:  `In order to manipulate many devices at the same time`,
+	Long:  `Advance network test tool for TeSysT, in order to manipulate many devices at the same time`,
 }
 
 // Execute adds all child commands to the root command sets flags appropriately.
