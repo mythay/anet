@@ -32,6 +32,7 @@ import (
 	ui "github.com/gizak/termui"
 
 	"github.com/mythay/anet/util"
+	"github.com/mythay/modbus"
 	"github.com/spf13/cobra"
 )
 
@@ -39,11 +40,14 @@ var flagPingCount, flagPingInterval, flagPingTimeout int
 var flagPingForever bool
 var pauseSignal = make(chan int)
 
+var mbServer *modbus.TcpServer
+var mbh mbhandler
+
 // pingCmd represents the ping command
 var pingCmd = &cobra.Command{
 	Use:   "ping [ip]...",
-	Short: "Advanced ping command",
-	Long: `Advanced ping command to test multiple target at the sametime.
+	Short: "Advanced ping command (need super privillege)",
+	Long: `Advanced ping command to test multiple target at the sametime (need super privillege). 
 For example:
 	anet ping 192.168.1.1-10`,
 	RunE: func(cmd *cobra.Command, args []string) error {
@@ -57,11 +61,24 @@ For example:
 		if err != nil {
 			return err
 		}
+		mbServer, err = modbus.NewTcpServer(502)
+		if err != nil {
+			return err
+		}
+
+		mbh.data[0] = uint16(flagPingInterval)
+		mbh.data[1] = uint16(flagPingTimeout)
+
+		go func() {
+			defer mbServer.Close()
+			mbServer.ServeModbus(&mbh)
+		}()
 		err = ui.Init()
 		if err != nil {
 			panic(err)
 		}
 		defer ui.Close()
+
 		// nips := len(ips)
 		helpBox := ui.NewList()
 		helpBox.Items = []string{
@@ -86,6 +103,7 @@ For example:
 		for _, ip := range ips {
 			p, err := newPinger(ip, time.Millisecond*time.Duration(flagPingInterval), time.Millisecond*time.Duration(flagPingTimeout))
 			if err != nil {
+
 				return err
 			}
 			pingers = append(pingers, p)
@@ -112,11 +130,29 @@ For example:
 		ui.Body.Align()
 
 		ui.Render(ui.Body)
-
-		ui.Handle("/timer/1s", func(ui.Event) {
+		var clearStat = func() {
+			for i, p := range pingers {
+				p.average = 0
+				p.max = 0
+				p.errcount = 0
+				p.sucesscount = 0
+				p.reqcount = 0
+				p.seq = 0
+				p.rtt = []time.Duration{}
+				sparkLines.Lines[i].Title = fmt.Sprintf("%-15s avg:%-4d max:%-4d err:%-4d/%-4d", p.conn.RemoteAddr().String(), p.average/1e6, p.max/1e6, p.errcount, p.reqcount)
+				sparkLines.Lines[i].Data = toms(p.rtt, 80)
+				statBox.Rows[1][0] = ""
+			}
+		}
+		var updateStat = func() {
 			var maxRtt time.Duration
 			var totalCount, errorCount, maxErrorCount int
 			var maxRttIp, maxErrIp string
+
+			if mbh.data[9] > 0 { // monitor the register 9 to clear
+				clearStat()
+				mbh.data[9] = 0
+			}
 
 			for i, p := range pingers {
 				if maxRtt < p.max {
@@ -129,6 +165,7 @@ For example:
 				}
 				errorCount += p.errcount
 				totalCount += p.reqcount
+
 				sparkLines.Lines[i].Title = fmt.Sprintf("%-15s avg:%-4d max:%-4d err:%-4d/%-4d", p.conn.RemoteAddr().String(), p.average/1e6, p.max/1e6, p.errcount, p.reqcount)
 				sparkLines.Lines[i].Data = toms(p.rtt, 80)
 			}
@@ -140,6 +177,10 @@ For example:
 			ui.Body.Align()
 			ui.Clear()
 			ui.Render(ui.Body)
+		}
+
+		ui.Handle("/timer/1s", func(ui.Event) {
+			updateStat()
 		})
 		ui.Handle("/sys/kbd/q", func(ui.Event) {
 			ui.StopLoop()
@@ -154,19 +195,9 @@ For example:
 			}
 			pauseFlag = !pauseFlag
 		})
+
 		ui.Handle("/sys/kbd/c", func(ui.Event) {
-			for i, p := range pingers {
-				p.average = 0
-				p.max = 0
-				p.errcount = 0
-				p.sucesscount = 0
-				p.reqcount = 0
-				p.seq = 0
-				p.rtt = []time.Duration{}
-				sparkLines.Lines[i].Title = fmt.Sprintf("%-15s avg:%-4d max:%-4d err:%-4d/%-4d", p.conn.RemoteAddr().String(), p.average/1e6, p.max/1e6, p.errcount, p.reqcount)
-				sparkLines.Lines[i].Data = toms(p.rtt, 80)
-				statBox.Rows[1][0] = ""
-			}
+			clearStat()
 		})
 		ui.Handle("/sys/wnd/resize", func(e ui.Event) {
 			ui.Body.Width = ui.TermWidth()
@@ -182,7 +213,7 @@ For example:
 func init() {
 	RootCmd.AddCommand(pingCmd)
 	pingCmd.Flags().IntVarP(&flagPingCount, "count", "c", 5, "pinging count until stop")
-	pingCmd.Flags().IntVarP(&flagPingInterval, "interval", "i", 1000, "wait interval ms between sending two request")
+	pingCmd.Flags().IntVarP(&flagPingInterval, "interval", "i", 1000, "interval ms between two request")
 	pingCmd.Flags().IntVarP(&flagPingTimeout, "timeout", "W", 5000, "wait timeout ms for response")
 	pingCmd.Flags().BoolVarP(&flagPingForever, "forever", "t", false, "pinging forever")
 
@@ -199,11 +230,13 @@ type pinger struct {
 	max         time.Duration
 	interval    time.Duration
 	timeout     time.Duration
+	mbaddress   int
 }
 
 func newPinger(ip net.IP, interval time.Duration, timeout time.Duration) (*pinger, error) {
 	var err error
-	p := &pinger{interval: interval, timeout: timeout}
+	p := &pinger{interval: interval, timeout: timeout, mbaddress: int(ip.To4()[3]) * 10}
+	ip.To4()
 	p.conn, err = net.DialTimeout("ip4:icmp", ip.String(), time.Second)
 	if err != nil {
 		return nil, err
@@ -228,7 +261,7 @@ func (p *pinger) once() error {
 	}
 	defer func() {
 		if err != nil {
-			ioutil.ReadAll(p.conn)
+			flush(p.conn)
 		}
 	}()
 	respPacket := make([]byte, 1500)
@@ -275,23 +308,29 @@ func (p *pinger) once() error {
 }
 
 func (p *pinger) ping(count int) {
+	var oneloop = func() {
+		_, _ = <-pauseSignal
+		start := time.Now()
+		err := p.once()
+		if err != nil {
+			// fmt.Println(err)
+		}
+
+		mbh.data[p.mbaddress] = uint16(p.errcount)
+		mbh.data[p.mbaddress+1] = uint16(p.max / 1e6)
+		mbh.data[p.mbaddress+2] = uint16(p.reqcount)
+		duration := time.Now().Sub(start)
+		if duration < p.interval {
+			time.Sleep(p.interval - duration)
+		}
+	}
 	if count < 0 {
 		for {
-			_, _ = <-pauseSignal
-			err := p.once()
-			if err != nil {
-				// fmt.Println(err)
-			}
-			time.Sleep(p.interval)
+			oneloop()
 		}
 	} else {
 		for i := 0; i < count; i++ {
-			_, _ = <-pauseSignal
-			err := p.once()
-			if err != nil {
-				// fmt.Println(err)
-			}
-			time.Sleep(p.interval)
+			oneloop()
 		}
 	}
 
@@ -320,4 +359,38 @@ func toms(s []time.Duration, size int) []int {
 	}
 
 	return r
+}
+
+type mbhandler struct {
+	data [256 * 10]uint16
+}
+
+func (s *mbhandler) ReadHoldingRegisters(slaveid byte, address, quantity uint16) ([]uint16, error) {
+	var buf []uint16
+	if address < uint16(len(s.data)) && address+quantity-1 < uint16(len(s.data)) {
+		buf = append(buf, s.data[address:address+quantity]...)
+		return buf, nil
+	}
+	return nil, fmt.Errorf("out of range")
+}
+func (s *mbhandler) WriteSingleRegister(slaveid byte, address, value uint16) error {
+	if address < uint16(len(s.data)) {
+		s.data[address] = value
+		return nil
+	}
+	return fmt.Errorf("out of range")
+}
+
+func flush(c net.Conn) (err error) {
+	if err = c.SetReadDeadline(time.Now()); err != nil {
+		return
+	}
+	// Timeout setting will be reset when reading
+	if _, err = ioutil.ReadAll(c); err != nil {
+		// Ignore timeout error
+		if netError, ok := err.(net.Error); ok && netError.Timeout() {
+			err = nil
+		}
+	}
+	return
 }
