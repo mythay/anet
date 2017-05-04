@@ -92,7 +92,7 @@ type fileUpload struct {
 func uploadSimpleView(ips []net.IP) error {
 	// try to create all the task
 	var progress = uiprogress.New()
-	progress.Width = 40
+	progress.Width = 30
 	nips := len(ips)
 	allprogress := make([]simpleUIBind, nips)
 	wg := sync.WaitGroup{}

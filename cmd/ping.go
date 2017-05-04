@@ -31,6 +31,8 @@ import (
 
 	ui "github.com/gizak/termui"
 
+	"sync/atomic"
+
 	"github.com/mythay/anet/util"
 	"github.com/mythay/modbus"
 	"github.com/spf13/cobra"
@@ -134,10 +136,10 @@ For example:
 			for i, p := range pingers {
 				p.average = 0
 				p.max = 0
-				p.errcount = 0
-				p.sucesscount = 0
-				p.reqcount = 0
-				p.seq = 0
+				atomic.StoreUint32(&p.errcount, 0)
+				atomic.StoreUint32(&p.sucesscount, 0)
+				atomic.StoreUint32(&p.reqcount, 0)
+				// p.seq = 0
 				p.rtt = []time.Duration{}
 				sparkLines.Lines[i].Title = fmt.Sprintf("%-15s avg:%-4d max:%-4d err:%-4d/%-4d", p.conn.RemoteAddr().String(), p.average/1e6, p.max/1e6, p.errcount, p.reqcount)
 				sparkLines.Lines[i].Data = toms(p.rtt, 80)
@@ -146,7 +148,7 @@ For example:
 		}
 		var updateStat = func() {
 			var maxRtt time.Duration
-			var totalCount, errorCount, maxErrorCount int
+			var totalCount, errorCount, maxErrorCount uint32
 			var maxRttIp, maxErrIp string
 
 			if mbh.data[9] > 0 { // monitor the register 9 to clear
@@ -173,7 +175,7 @@ For example:
 			if startTime == "" {
 				startTime = time.Now().Format("15:04:05")
 			}
-			statBox.Rows[1] = []string{startTime, strconv.Itoa(totalCount), strconv.Itoa(errorCount), strconv.Itoa(int(maxRtt / 1e6)), maxRttIp, maxErrIp}
+			statBox.Rows[1] = []string{startTime, strconv.FormatUint(uint64(totalCount), 10), strconv.FormatUint(uint64(errorCount), 10), strconv.FormatUint(uint64(maxRtt/1e6), 10), maxRttIp, maxErrIp}
 			ui.Body.Align()
 			ui.Clear()
 			ui.Render(ui.Body)
@@ -222,9 +224,9 @@ func init() {
 type pinger struct {
 	conn        net.Conn
 	seq         int
-	sucesscount int
-	reqcount    int
-	errcount    int
+	sucesscount uint32
+	reqcount    uint32
+	errcount    uint32
 	rtt         []time.Duration
 	average     time.Duration
 	max         time.Duration
@@ -251,23 +253,20 @@ func (p *pinger) once() error {
 		p.seq = 0
 	}
 	reqPacket, _ := p.marshalMsg(nil)
-	p.reqcount++
+
+	atomic.AddUint32(&p.reqcount, 1)
 
 	start := time.Now()
 	p.conn.SetDeadline(start.Add(p.timeout))
 	if _, err = p.conn.Write(reqPacket); err != nil {
-		p.errcount++
+		atomic.AddUint32(&p.errcount, 1)
 		return err
 	}
-	defer func() {
-		if err != nil {
-			flush(p.conn)
-		}
-	}()
+
 	respPacket := make([]byte, 1500)
 	n, err := p.conn.Read(respPacket)
 	if err != nil {
-		p.errcount++
+		atomic.AddUint32(&p.errcount, 1)
 		return err
 	}
 
@@ -281,13 +280,13 @@ func (p *pinger) once() error {
 	}(respPacket)
 	rm, err := icmp.ParseMessage(1, respPacket[:n])
 	if err != nil {
-		p.errcount++
+		atomic.AddUint32(&p.errcount, 1)
 		return err
 	}
 	if rm.Type == ipv4.ICMPTypeEchoReply {
 		body := rm.Body.(*icmp.Echo)
 		if body.Seq != p.seq {
-			p.errcount++
+			atomic.AddUint32(&p.errcount, 1)
 			err = fmt.Errorf("sequence not equal, expect %d, but %d", p.seq, body.Seq)
 			return err
 		}
@@ -295,14 +294,15 @@ func (p *pinger) once() error {
 			p.max = duration
 		}
 		p.average = (p.average*time.Duration(p.sucesscount) + duration) / time.Duration(p.sucesscount+1)
-		p.sucesscount++
+
+		atomic.AddUint32(&p.sucesscount, 1)
 		if len(p.rtt) > 1000 {
 			p.rtt = append([]time.Duration{}, p.rtt[500:]...)
 		}
 		p.rtt = append(p.rtt, duration)
 
 	} else {
-		p.errcount++
+		atomic.AddUint32(&p.errcount, 1)
 	}
 	return nil
 }
@@ -313,12 +313,13 @@ func (p *pinger) ping(count int) {
 		start := time.Now()
 		err := p.once()
 		if err != nil {
+			flush(p.conn, start.Add(p.interval))
 			// fmt.Println(err)
 		}
 
-		mbh.data[p.mbaddress] = uint16(p.errcount)
+		mbh.data[p.mbaddress] = uint16(atomic.LoadUint32(&p.errcount))
 		mbh.data[p.mbaddress+1] = uint16(p.max / 1e6)
-		mbh.data[p.mbaddress+2] = uint16(p.reqcount)
+		mbh.data[p.mbaddress+2] = uint16(atomic.LoadUint32(&p.reqcount))
 		duration := time.Now().Sub(start)
 		if duration < p.interval {
 			time.Sleep(p.interval - duration)
@@ -381,8 +382,8 @@ func (s *mbhandler) WriteSingleRegister(slaveid byte, address, value uint16) err
 	return fmt.Errorf("out of range")
 }
 
-func flush(c net.Conn) (err error) {
-	if err = c.SetReadDeadline(time.Now()); err != nil {
+func flush(c net.Conn, t time.Time) (err error) {
+	if err = c.SetReadDeadline(t); err != nil {
 		return
 	}
 	// Timeout setting will be reset when reading
