@@ -18,6 +18,7 @@ import (
 	"errors"
 	"io/ioutil"
 	"os"
+	"runtime/pprof"
 
 	"golang.org/x/net/icmp"
 	"golang.org/x/net/ipv4"
@@ -30,8 +31,6 @@ import (
 	"strconv"
 
 	ui "github.com/gizak/termui"
-
-	"sync/atomic"
 
 	"github.com/mythay/anet/util"
 	"github.com/mythay/modbus"
@@ -55,6 +54,9 @@ For example:
 	RunE: func(cmd *cobra.Command, args []string) error {
 		// TODO: Work your own magic here
 		var err error
+		f, _ := os.Create("profile_file")
+		pprof.StartCPUProfile(f)
+		defer pprof.StopCPUProfile()
 		nargs := len(args)
 		if nargs == 0 {
 			return errors.New("at least one ip is needed")
@@ -136,9 +138,9 @@ For example:
 			for i, p := range pingers {
 				p.average = 0
 				p.max = 0
-				atomic.StoreUint32(&p.errcount, 0)
-				atomic.StoreUint32(&p.sucesscount, 0)
-				atomic.StoreUint32(&p.reqcount, 0)
+				p.errcount = 0
+				p.sucesscount = 0
+				p.reqcount = 0
 				// p.seq = 0
 				p.rtt = []time.Duration{}
 				sparkLines.Lines[i].Title = fmt.Sprintf("%-15s avg:%-4d max:%-4d err:%-4d/%-4d", p.conn.RemoteAddr().String(), p.average/1e6, p.max/1e6, p.errcount, p.reqcount)
@@ -254,19 +256,19 @@ func (p *pinger) once() error {
 	}
 	reqPacket, _ := p.marshalMsg(nil)
 
-	atomic.AddUint32(&p.reqcount, 1)
+	p.reqcount++
 
 	start := time.Now()
 	p.conn.SetDeadline(start.Add(p.timeout))
 	if _, err = p.conn.Write(reqPacket); err != nil {
-		atomic.AddUint32(&p.errcount, 1)
+		p.errcount++
 		return err
 	}
 
 	respPacket := make([]byte, 1500)
 	n, err := p.conn.Read(respPacket)
 	if err != nil {
-		atomic.AddUint32(&p.errcount, 1)
+		p.errcount++
 		return err
 	}
 
@@ -280,13 +282,13 @@ func (p *pinger) once() error {
 	}(respPacket)
 	rm, err := icmp.ParseMessage(1, respPacket[:n])
 	if err != nil {
-		atomic.AddUint32(&p.errcount, 1)
+		p.errcount++
 		return err
 	}
 	if rm.Type == ipv4.ICMPTypeEchoReply {
 		body := rm.Body.(*icmp.Echo)
 		if body.Seq != p.seq {
-			atomic.AddUint32(&p.errcount, 1)
+			p.errcount++
 			err = fmt.Errorf("sequence not equal, expect %d, but %d", p.seq, body.Seq)
 			return err
 		}
@@ -295,14 +297,14 @@ func (p *pinger) once() error {
 		}
 		p.average = (p.average*time.Duration(p.sucesscount) + duration) / time.Duration(p.sucesscount+1)
 
-		atomic.AddUint32(&p.sucesscount, 1)
+		p.sucesscount++
 		if len(p.rtt) > 1000 {
 			p.rtt = append([]time.Duration{}, p.rtt[500:]...)
 		}
 		p.rtt = append(p.rtt, duration)
 
 	} else {
-		atomic.AddUint32(&p.errcount, 1)
+		p.errcount++
 	}
 	return nil
 }
@@ -314,12 +316,12 @@ func (p *pinger) ping(count int) {
 		err := p.once()
 		if err != nil {
 			flush(p.conn, start.Add(p.interval))
-			// fmt.Println(err)
+			fmt.Println(err)
 		}
 
-		mbh.data[p.mbaddress] = uint16(atomic.LoadUint32(&p.errcount))
+		mbh.data[p.mbaddress] = uint16(p.errcount)
 		mbh.data[p.mbaddress+1] = uint16(p.max / 1e6)
-		mbh.data[p.mbaddress+2] = uint16(atomic.LoadUint32(&p.reqcount))
+		mbh.data[p.mbaddress+2] = uint16(p.reqcount)
 		duration := time.Now().Sub(start)
 		if duration < p.interval {
 			time.Sleep(p.interval - duration)
