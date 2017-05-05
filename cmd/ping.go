@@ -20,6 +20,9 @@ import (
 	"os"
 	"runtime/pprof"
 
+	"os/signal"
+	"syscall"
+
 	"golang.org/x/net/icmp"
 	"golang.org/x/net/ipv4"
 
@@ -28,9 +31,6 @@ import (
 	"time"
 
 	"fmt"
-	"strconv"
-
-	ui "github.com/gizak/termui"
 
 	"github.com/mythay/anet/util"
 	"github.com/mythay/modbus"
@@ -77,33 +77,9 @@ For example:
 			defer mbServer.Close()
 			mbServer.ServeModbus(&mbh)
 		}()
-		err = ui.Init()
-		if err != nil {
-			panic(err)
-		}
-		defer ui.Close()
 
-		// nips := len(ips)
-		helpBox := ui.NewList()
-		helpBox.Items = []string{
-			"Press q to quit",
-			"Press c to clear",
-			"Press p to pause/continue",
-		}
-		helpBox.BorderLabel = "Help"
-		helpBox.Height = 5
-		helpBox.ItemFgColor = ui.ColorYellow
-		statBox := ui.NewTable()
-		statBox.Rows = [][]string{
-			[]string{"time", "total", "error", "max rtt", "max rtt ip", "max err ip"},
-			[]string{"", "0", "0", "0", "", ""},
-		}
-		statBox.Height = 5
-		// statBox.Separator = false
-		ui.Body.AddRows(ui.NewRow(ui.NewCol(8, 0, statBox), ui.NewCol(4, 0, helpBox)))
 		var pingers []*pinger
-		sparkLines := ui.NewSparklines()
-		sparkLines.BorderLabel = "Dashboard"
+
 		for _, ip := range ips {
 			p, err := newPinger(ip, time.Millisecond*time.Duration(flagPingInterval), time.Millisecond*time.Duration(flagPingTimeout))
 			if err != nil {
@@ -111,14 +87,8 @@ For example:
 				return err
 			}
 			pingers = append(pingers, p)
-			spl := ui.NewSparkline()
-			spl.Data = nil
-			spl.Title = ip.String()
-			spl.LineColor = ui.ColorRed
-			sparkLines.Add(spl)
+
 		}
-		sparkLines.Height = len(sparkLines.Lines)*2 + 2
-		ui.Body.AddRows(ui.NewRow(ui.NewCol(10, 0, sparkLines)))
 
 		for _, p := range pingers {
 			go func(p *pinger) {
@@ -131,85 +101,49 @@ For example:
 				// fmt.Println(p.conn.RemoteAddr(), p)
 			}(p)
 		}
-		ui.Body.Align()
 
-		ui.Render(ui.Body)
-		var clearStat = func() {
-			for i, p := range pingers {
-				p.average = 0
-				p.max = 0
-				p.errcount = 0
-				p.sucesscount = 0
-				p.reqcount = 0
-				// p.seq = 0
-				p.rtt = []time.Duration{}
-				sparkLines.Lines[i].Title = fmt.Sprintf("%-15s avg:%-4d max:%-4d err:%-4d/%-4d", p.conn.RemoteAddr().String(), p.average/1e6, p.max/1e6, p.errcount, p.reqcount)
-				sparkLines.Lines[i].Data = toms(p.rtt, 80)
-				statBox.Rows[1][0] = ""
-			}
-		}
-		var updateStat = func() {
-			var maxRtt time.Duration
-			var totalCount, errorCount, maxErrorCount uint32
-			var maxRttIp, maxErrIp string
+		// var clearStat = func() {
+		// 	for _, p := range pingers {
+		// 		p.average = 0
+		// 		p.max = 0
+		// 		p.errcount = 0
+		// 		p.sucesscount = 0
+		// 		p.reqcount = 0
+		// 		// p.seq = 0
+		// 		p.rtt = []time.Duration{}
 
-			if mbh.data[9] > 0 { // monitor the register 9 to clear
-				clearStat()
-				mbh.data[9] = 0
-			}
+		// 	}
+		// }
+		// var updateStat = func() {
+		// 	var maxRtt time.Duration
+		// 	var totalCount, errorCount, maxErrorCount uint32
 
-			for i, p := range pingers {
-				if maxRtt < p.max {
-					maxRtt = p.max
-					maxRttIp = p.conn.RemoteAddr().String()
-				}
-				if maxErrorCount < p.errcount {
-					maxErrorCount = p.errcount
-					maxErrIp = p.conn.RemoteAddr().String()
-				}
-				errorCount += p.errcount
-				totalCount += p.reqcount
+		// 	if mbh.data[9] > 0 { // monitor the register 9 to clear
+		// 		clearStat()
+		// 		mbh.data[9] = 0
+		// 	}
 
-				sparkLines.Lines[i].Title = fmt.Sprintf("%-15s avg:%-4d max:%-4d err:%-4d/%-4d", p.conn.RemoteAddr().String(), p.average/1e6, p.max/1e6, p.errcount, p.reqcount)
-				sparkLines.Lines[i].Data = toms(p.rtt, 80)
-			}
-			startTime := statBox.Rows[1][0]
-			if startTime == "" {
-				startTime = time.Now().Format("15:04:05")
-			}
-			statBox.Rows[1] = []string{startTime, strconv.FormatUint(uint64(totalCount), 10), strconv.FormatUint(uint64(errorCount), 10), strconv.FormatUint(uint64(maxRtt/1e6), 10), maxRttIp, maxErrIp}
-			ui.Body.Align()
-			ui.Clear()
-			ui.Render(ui.Body)
-		}
+		// 	for _, p := range pingers {
+		// 		if maxRtt < p.max {
+		// 			maxRtt = p.max
+		// 		}
+		// 		if maxErrorCount < p.errcount {
+		// 			maxErrorCount = p.errcount
+		// 		}
+		// 		errorCount += p.errcount
+		// 		totalCount += p.reqcount
 
-		ui.Handle("/timer/1s", func(ui.Event) {
-			updateStat()
-		})
-		ui.Handle("/sys/kbd/q", func(ui.Event) {
-			ui.StopLoop()
-		})
-		var pauseFlag = false
+		// 	}
+
+		// }
+
+		// var pauseFlag = false
 		close(pauseSignal)
-		ui.Handle("/sys/kbd/p", func(ui.Event) {
-			if !pauseFlag {
-				pauseSignal = make(chan int)
-			} else {
-				close(pauseSignal)
-			}
-			pauseFlag = !pauseFlag
-		})
-
-		ui.Handle("/sys/kbd/c", func(ui.Event) {
-			clearStat()
-		})
-		ui.Handle("/sys/wnd/resize", func(e ui.Event) {
-			ui.Body.Width = ui.TermWidth()
-			ui.Body.Align()
-			ui.Clear()
-			ui.Render(ui.Body)
-		})
-		ui.Loop()
+		sigs := make(chan os.Signal, 1)
+		signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
+		fmt.Println("awaiting signal")
+		<-sigs
+		fmt.Println("exiting")
 		return err
 	},
 }
