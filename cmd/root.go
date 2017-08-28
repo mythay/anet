@@ -21,7 +21,7 @@ import (
 	"github.com/spf13/cobra"
 )
 
-var flagVerbose, flagSilent bool
+var flagVerbose, flagQuiet bool
 
 // RootCmd represents the base command when called without any subcommands
 var RootCmd = &cobra.Command{
@@ -47,6 +47,6 @@ func init() {
 	// will be global for your application.
 
 	RootCmd.PersistentFlags().BoolVarP(&flagVerbose, "verbose", "v", false, "output verbose message")
-	RootCmd.PersistentFlags().BoolVarP(&flagSilent, "silent", "s", false, "solent mode, no output")
+	RootCmd.PersistentFlags().BoolVarP(&flagQuiet, "quiet", "q", false, "quiet mode, no output")
 
 }

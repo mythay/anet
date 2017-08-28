@@ -15,9 +15,11 @@
 package cmd
 
 import (
+	"bytes"
 	"errors"
 	"io/ioutil"
 	"os"
+	"strings"
 
 	"golang.org/x/net/icmp"
 	"golang.org/x/net/ipv4"
@@ -36,12 +38,16 @@ import (
 	"github.com/spf13/cobra"
 )
 
-var flagPingCount, flagPingInterval, flagPingTimeout int
+var flagPingCount, flagPingInterval, flagPingTimeout, flagPingPacketSize int
 var flagPingForever bool
 var pauseSignal = make(chan int)
 
 var mbServer *modbus.TcpServer
 var mbh mbhandler
+
+const icmpPadPattern = "Henry Hei create this program for TeSysT. "
+
+var icmpPad []byte
 
 // pingCmd represents the ping command
 var pingCmd = &cobra.Command{
@@ -57,6 +63,10 @@ For example:
 		if nargs == 0 {
 			return errors.New("at least one ip is needed")
 		}
+		if flagPingPacketSize < 0 || flagPingPacketSize > 1518 {
+			return fmt.Errorf("invalid icmp packet size '%d'", flagPingPacketSize)
+		}
+		icmpPad = bytes.NewBufferString(strings.Repeat(icmpPadPattern, flagPingPacketSize/len(icmpPadPattern)+1)).Bytes()[:flagPingPacketSize]
 		ips, err := util.ParseMultipleIPRange(args...)
 		if err != nil {
 			return err
@@ -213,6 +223,7 @@ For example:
 func init() {
 	RootCmd.AddCommand(pingCmd)
 	pingCmd.Flags().IntVarP(&flagPingCount, "count", "c", 5, "pinging count until stop")
+	pingCmd.Flags().IntVarP(&flagPingPacketSize, "packetsize", "s", 22, "the number of data bytes to be sent")
 	pingCmd.Flags().IntVarP(&flagPingInterval, "interval", "i", 1000, "interval ms between two request")
 	pingCmd.Flags().IntVarP(&flagPingTimeout, "timeout", "W", 5000, "wait timeout ms for response")
 	pingCmd.Flags().BoolVarP(&flagPingForever, "forever", "t", false, "pinging forever")
@@ -250,7 +261,7 @@ func (p *pinger) once() error {
 	if p.seq > 0xffff {
 		p.seq = 0
 	}
-	reqPacket, _ := p.marshalMsg(nil)
+	reqPacket, _ := p.marshalMsg(icmpPad)
 
 	p.reqcount++
 
