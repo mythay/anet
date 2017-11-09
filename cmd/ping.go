@@ -159,11 +159,6 @@ For example:
 			var totalCount, errorCount, maxErrorCount uint32
 			var maxRttIp, maxErrIp string
 
-			if mbh.data[9] > 0 { // monitor the register 9 to clear
-				clearStat()
-				mbh.data[9] = 0
-			}
-
 			for i, p := range pingers {
 				if maxRtt < p.max {
 					maxRtt = p.max
@@ -383,6 +378,10 @@ func (s *mbhandler) ReadHoldingRegisters(slaveid byte, address, quantity uint16)
 func (s *mbhandler) WriteSingleRegister(slaveid byte, address, value uint16) error {
 	if address < uint16(len(s.data)) {
 		s.data[address] = value
+		if mbh.data[9] > 0 { // monitor the register 9 to clear
+			mbh.data[9] = 0
+			ui.SendCustomEvt("/sys/kbd/c", nil)
+		}
 		return nil
 	}
 	return fmt.Errorf("out of range")
