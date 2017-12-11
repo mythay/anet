@@ -16,7 +16,7 @@ func Test_newPinger(t *testing.T) {
 		ips, _ := util.ParseMultipleIPRange("192.168.16.9-20")
 		for _, ip := range ips {
 			go func(ip net.IP) {
-				p, _ := newPinger(ip, time.Millisecond*100, time.Millisecond*200)
+				p, _ := newPinger(ip, time.Millisecond*100, time.Millisecond*200, time.Millisecond*200)
 				p.ping(-1)
 			}(ip)
 		}

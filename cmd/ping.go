@@ -20,6 +20,7 @@ import (
 	"io/ioutil"
 	"os"
 	"strings"
+	"sync/atomic"
 
 	"golang.org/x/net/icmp"
 	"golang.org/x/net/ipv4"
@@ -38,7 +39,7 @@ import (
 	"github.com/spf13/cobra"
 )
 
-var flagPingCount, flagPingInterval, flagPingTimeout, flagPingPacketSize int
+var flagPingCount, flagPingInterval, flagPingTimeout, flagPingRecoverySlot, flagPingPacketSize int
 var flagPingForever bool
 var pauseSignal = make(chan int)
 
@@ -111,7 +112,7 @@ For example:
 		sparkLines := ui.NewSparklines()
 		sparkLines.BorderLabel = "Dashboard"
 		for _, ip := range ips {
-			p, err := newPinger(ip, time.Millisecond*time.Duration(flagPingInterval), time.Millisecond*time.Duration(flagPingTimeout))
+			p, err := newPinger(ip, time.Millisecond*time.Duration(flagPingInterval), time.Millisecond*time.Duration(flagPingTimeout), time.Millisecond*time.Duration(flagPingRecoverySlot))
 			if err != nil {
 
 				return err
@@ -120,7 +121,7 @@ For example:
 			spl := ui.NewSparkline()
 			spl.Data = nil
 			spl.Title = ip.String()
-			spl.LineColor = ui.ColorRed
+			spl.LineColor = ui.ColorGreen
 			sparkLines.Add(spl)
 		}
 		sparkLines.Height = len(sparkLines.Lines)*2 + 2
@@ -142,14 +143,8 @@ For example:
 		ui.Render(ui.Body)
 		var clearStat = func() {
 			for i, p := range pingers {
-				p.average = 0
-				p.max = 0
-				p.errcount = 0
-				p.sucesscount = 0
-				p.reqcount = 0
-				// p.seq = 0
-				p.rtt = []time.Duration{}
-				sparkLines.Lines[i].Title = fmt.Sprintf("%-15s avg:%-4d max:%-4d err:%-4d/%-4d", p.conn.RemoteAddr().String(), p.average/1e6, p.max/1e6, p.errcount, p.reqcount)
+				p.resetCounter()
+				sparkLines.Lines[i].Title = fmt.Sprintf("%-15s avg:%-4d max:%-4d err:%-4d/%-4d ", p.conn.RemoteAddr().String(), p.average/1e6, p.max/1e6, p.errcount, p.reqcount)
 				sparkLines.Lines[i].Data = toms(p.rtt, 80)
 				statBox.Rows[1][0] = ""
 			}
@@ -157,28 +152,28 @@ For example:
 		var updateStat = func() {
 			var maxRtt time.Duration
 			var totalCount, errorCount, maxErrorCount uint32
-			var maxRttIp, maxErrIp string
+			var maxRttIP, maxErrIP string
 
 			for i, p := range pingers {
 				if maxRtt < p.max {
 					maxRtt = p.max
-					maxRttIp = p.conn.RemoteAddr().String()
+					maxRttIP = p.conn.RemoteAddr().String()
 				}
 				if maxErrorCount < p.errcount {
 					maxErrorCount = p.errcount
-					maxErrIp = p.conn.RemoteAddr().String()
+					maxErrIP = p.conn.RemoteAddr().String()
 				}
 				errorCount += p.errcount
 				totalCount += p.reqcount
 
-				sparkLines.Lines[i].Title = fmt.Sprintf("%-15s avg:%-4d max:%-4d err:%-4d/%-4d", p.conn.RemoteAddr().String(), p.average/1e6, p.max/1e6, p.errcount, p.reqcount)
+				sparkLines.Lines[i].Title = fmt.Sprintf("%-15s avg:%-4d max:%-4d err:%-4d/%-4d | %v", p.conn.RemoteAddr().String(), p.average/1e6, p.max/1e6, p.errcount, p.reqcount, p.errlist)
 				sparkLines.Lines[i].Data = toms(p.rtt, 80)
 			}
 			startTime := statBox.Rows[1][0]
 			if startTime == "" {
 				startTime = time.Now().Format("15:04:05")
 			}
-			statBox.Rows[1] = []string{startTime, strconv.FormatUint(uint64(totalCount), 10), strconv.FormatUint(uint64(errorCount), 10), strconv.FormatUint(uint64(maxRtt/1e6), 10), maxRttIp, maxErrIp}
+			statBox.Rows[1] = []string{startTime, strconv.FormatUint(uint64(totalCount), 10), strconv.FormatUint(uint64(errorCount), 10), strconv.FormatUint(uint64(maxRtt/1e6), 10), maxRttIP, maxErrIP}
 			ui.Body.Align()
 			ui.Clear()
 			ui.Render(ui.Body)
@@ -221,33 +216,49 @@ func init() {
 	pingCmd.Flags().IntVarP(&flagPingPacketSize, "packetsize", "s", 22, "the number of data bytes to be sent")
 	pingCmd.Flags().IntVarP(&flagPingInterval, "interval", "i", 1000, "interval ms between two request")
 	pingCmd.Flags().IntVarP(&flagPingTimeout, "timeout", "W", 5000, "wait timeout ms for response")
+	pingCmd.Flags().IntVarP(&flagPingRecoverySlot, "recover", "r", 0, "recover checking slot to reset errors")
 	pingCmd.Flags().BoolVarP(&flagPingForever, "forever", "t", false, "pinging forever")
 
 }
 
 type pinger struct {
-	conn        net.Conn
-	seq         int
-	sucesscount uint32
-	reqcount    uint32
-	errcount    uint32
-	rtt         []time.Duration
-	average     time.Duration
-	max         time.Duration
-	interval    time.Duration
-	timeout     time.Duration
-	mbaddress   int
+	conn         net.Conn
+	seq          int
+	sucesscount  uint32
+	reqcount     uint32
+	errcount     uint32
+	errlist      []uint32
+	islasterror  bool
+	rtt          []time.Duration
+	average      time.Duration
+	max          time.Duration
+	interval     time.Duration
+	timeout      time.Duration
+	recoverSlot  time.Duration
+	recoverTimer *time.Timer
+	mbaddress    int
 }
 
-func newPinger(ip net.IP, interval time.Duration, timeout time.Duration) (*pinger, error) {
+func newPinger(ip net.IP, interval time.Duration, timeout time.Duration, recoverSlot time.Duration) (*pinger, error) {
 	var err error
-	p := &pinger{interval: interval, timeout: timeout, mbaddress: int(ip.To4()[3]) * 10}
+	p := &pinger{interval: interval, timeout: timeout, recoverSlot: recoverSlot, mbaddress: int(ip.To4()[3]) * 10}
 	ip.To4()
+	if recoverSlot > 0 {
+		p.recoverTimer = time.AfterFunc(recoverSlot, p.pushErrBacklog)
+	}
 	p.conn, err = net.DialTimeout("ip4:icmp", ip.String(), time.Second)
 	if err != nil {
 		return nil, err
 	}
 	return p, nil
+}
+
+func (p *pinger) pushErrBacklog() {
+	count := atomic.LoadUint32(&p.errcount)
+	atomic.StoreUint32(&p.errcount, 0)
+	if count > 0 {
+		p.errlist = append(p.errlist, count)
+	}
 }
 
 func (p *pinger) once() error {
@@ -314,13 +325,24 @@ func (p *pinger) ping(count int) {
 		err := p.once()
 		if err != nil {
 			flush(p.conn, start.Add(p.interval))
+			atomic.AddUint32(&p.errcount, 1)
 			p.errcount++
+			p.islasterror = true
 			// fmt.Println(err)
+		} else {
+			if p.islasterror && p.recoverTimer != nil {
+				p.islasterror = false
+				p.recoverTimer.Reset(p.recoverSlot)
+			}
 		}
 
 		mbh.data[p.mbaddress] = uint16(p.errcount)
 		mbh.data[p.mbaddress+1] = uint16(p.max / 1e6)
 		mbh.data[p.mbaddress+2] = uint16(p.reqcount)
+		for index, value := range p.errlist {
+			mbh.data[p.mbaddress+index+3] = uint16(value)
+		}
+
 		duration := time.Now().Sub(start)
 		if duration < p.interval {
 			time.Sleep(p.interval - duration)
@@ -348,6 +370,17 @@ func (p *pinger) marshalMsg(data []byte) ([]byte, error) {
 		},
 	}
 	return req.Marshal(nil)
+}
+
+func (p *pinger) resetCounter() {
+	p.average = 0
+	p.max = 0
+	p.errcount = 0
+	p.sucesscount = 0
+	p.reqcount = 0
+	// p.seq = 0
+	p.rtt = []time.Duration{}
+	p.errlist = []uint32{}
 }
 
 func toms(s []time.Duration, size int) []int {
@@ -378,8 +411,8 @@ func (s *mbhandler) ReadHoldingRegisters(slaveid byte, address, quantity uint16)
 func (s *mbhandler) WriteSingleRegister(slaveid byte, address, value uint16) error {
 	if address < uint16(len(s.data)) {
 		s.data[address] = value
-		if mbh.data[9] > 0 { // monitor the register 9 to clear
-			mbh.data[9] = 0
+		if s.data[9] > 0 { // monitor the register 9 to clear
+			s.data[9] = 0
 			ui.SendCustomEvt("/sys/kbd/c", nil)
 		}
 		return nil
